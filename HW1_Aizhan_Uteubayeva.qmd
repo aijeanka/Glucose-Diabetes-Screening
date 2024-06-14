@@ -1,0 +1,317 @@
+---
+title: "Homework 1: Abnormal Blood Glucose and Type 2 Diabetes Mellitus Screening"
+format: html
+editor: visual
+author: Aizhan Uteubayeva (NetID:au198)
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(RPostgres)
+library(connections)
+library(keyring)
+
+con <- connection_open(
+  RPostgres::Postgres(),
+  dbname = "synthea_covid",  
+  host = "34.138.243.178",   
+  port = 5432,               
+  user = "postgres",         
+  password = "HIDS505pass"    
+)
+```
+
+## Data acquisition
+
+### 1) Looking at all BMI patients
+
+```{sql connection=con}
+SELECT DISTINCT P.id AS patient_id
+FROM patient P
+JOIN bmi B ON P.id = B.patient;
+```
+
+#### Adding the "age" column
+
+```{sql connection=con}
+-- selecting all and storing in a new table with age column
+CREATE TEMPORARY TABLE temp_result_age AS
+SELECT DISTINCT
+    P.id AS patient_id,
+    P.birthdate,
+    P.deathdate,
+    P.race,
+    P.ethnicity,
+    P.gender,
+    B.value AS bmi_value,
+    -- Calculate age based on birthdate and deathdate
+    CASE
+        WHEN P.deathdate IS NOT NULL THEN 
+            EXTRACT(YEAR FROM AGE(P.deathdate, P.birthdate))
+        ELSE
+            EXTRACT(YEAR FROM AGE(CURRENT_DATE, P.birthdate))
+    END AS age
+FROM patient P
+JOIN bmi B ON P.id = B.patient
+JOIN conditions C ON P.id = C.patient;
+```
+
+```{sql connection=con}
+-- selecting all and storing in a new table
+SELECT * FROM temp_result_age;
+```
+
+### 2) Exclusion criteria
+Verifying the presence of "pregnancy" using the conditions table.
+
+```{sql connection=con}
+SELECT DISTINCT patient
+FROM conditions
+WHERE LOWER(description) LIKE '%pregnancy%';
+```
+
+```{sql connection=con}
+SELECT DISTINCT patient
+FROM conditions
+WHERE LOWER(description) LIKE '%pregnancy%'
+  AND (
+    (stop IS NULL AND start >= CURRENT_DATE - INTERVAL '1 year')
+    OR
+    (stop IS NOT NULL AND stop >= CURRENT_DATE - INTERVAL '1 year' AND stop <= '2020-05-17')
+  );
+
+```
+
+It appears that there are only records for two patients with evidence of pregnancy within the last year. This observation is based on the latest recorded information in Synthea, dated 2020-05-17, which has been taken into account for the analysis.
+
+#### Removing pregnant patients
+
+```{sql connection=con}
+-- creating a new table with no pregnant patients
+CREATE TEMPORARY TABLE temp_result_no_pregnancy AS
+SELECT DISTINCT
+    P.id AS patient_id,
+    P.birthdate,
+    P.deathdate,
+    P.race,
+    P.ethnicity,
+    P.gender,
+    B.value AS bmi_value,
+    -- calculating age based on birthdate and deathdate
+    CASE
+        WHEN P.deathdate IS NOT NULL THEN 
+            EXTRACT(YEAR FROM AGE(P.deathdate, P.birthdate))
+        ELSE
+            EXTRACT(YEAR FROM AGE(CURRENT_DATE, P.birthdate))
+    END AS age
+FROM patient P
+JOIN bmi B ON P.id = B.patient
+JOIN conditions C ON P.id = C.patient
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM conditions
+    WHERE LOWER(description) LIKE '%pregnancy%'
+      AND P.id = patient
+      AND (
+        (stop IS NULL AND start >= CURRENT_DATE - INTERVAL '1 year')
+        OR
+        (stop IS NOT NULL AND stop >= CURRENT_DATE - INTERVAL '1 year' AND stop <= '2020-05-17')
+      )
+);
+```
+
+```{sql connection=con}
+SELECT * FROM temp_result_no_pregnancy;
+```
+
+### 3) Inlcusion criteria
+
+```{sql connection=con}
+CREATE TEMPORARY TABLE temp_result_criteria AS
+SELECT *
+FROM temp_result_no_pregnancy
+WHERE (
+-- adding the age and bmi_value criteria
+    (
+        (age BETWEEN 40 AND 70 AND CAST(bmi_value AS numeric) >= 25)
+        OR
+        (
+            age BETWEEN 18 AND 39 AND CAST(bmi_value AS numeric) >= 25 AND (
+                race IN ('black', 'native')
+                OR ethnicity = 'Hispanic'
+            )
+        )
+        OR
+        (
+            age BETWEEN 18 AND 70 AND CAST(bmi_value AS numeric) >= 23 AND race = 'asian'
+        )
+    )
+);
+```
+
+```{sql connection=con}
+SELECT * FROM temp_result_criteria;
+```
+
+### 3) Only Type 1 and Type 2 Diabetes patients
+
+```{sql connection=con}
+SELECT DISTINCT patient, description
+FROM conditions
+WHERE LOWER(description) LIKE '%diabetes%'
+  AND (LOWER(description) LIKE '%type 1%' OR LOWER(description) LIKE '%type 2%');
+
+```
+
+```{sql connection=con}
+CREATE TEMPORARY TABLE temp_result_diabetes AS
+SELECT C.*, TRC.*
+FROM conditions C
+JOIN temp_result_criteria TRC ON C.patient = TRC.patient_id
+WHERE LOWER(C.description) LIKE '%diabetes%'
+  AND (LOWER(C.description) LIKE '%type 1%' OR LOWER(C.description) LIKE '%type 2%');
+```
+
+```{sql connection=con, output.var = "diabetes_patients"}
+SELECT * FROM temp_result_diabetes;
+```
+
+### 4) Glucose levels
+
+There appears to be a distinction between two types of glucose measurements that might have been conducted for diabetic patients. Additionally, a noteworthy observation is the potential mix-up between descriptions and codes, highlighting the need for careful consideration and validation in this context.
+
+```{sql connection=con}
+SELECT description, code, units, COUNT(*) AS measurement_count
+FROM observations
+WHERE LOWER(description) LIKE '%glucose%'
+GROUP BY description, code, units;
+```
+
+```{sql connection=con}
+-- Drop the diabetes_glucose temporary table
+-- DROP TABLE IF EXISTS diabetes_glucose;
+```
+
+Furthermore, it is noteworthy that the units of the measurements are presented in mg/dL. Consequently, a conversion was necessary to express these measurements as a percentage (%). This conversion was achieved using the following formula:
+
+```{sql connection=con}
+-- selecting the glucose levels for patients in diabetes_glucose
+-- adding a "hba1c_percentage" to diabetes_glucose with calculated values
+CREATE TEMPORARY TABLE diabetes_glucose AS
+SELECT O.*,
+    -- calculating the percentage
+    ((O.value::numeric) / 28.7) + 46.7 AS hba1c_percentage
+FROM observations O
+JOIN temp_result_diabetes TD ON O.patient = TD.patient_id
+WHERE O.code IN ('2339-0', '2345-7');
+```
+
+```{sql connection=con, output.var = "diabetes_glucose"}
+SELECT * FROM diabetes_glucose;
+```
+
+## Questions
+
+### 1. Number of patients meeting inclusion criteria
+
+The number of patients meeting the inclusion criteria is estimates around 2,106 patients.
+
+```{sql connection=con}
+SELECT COUNT(DISTINCT patient_id) AS patient_count
+FROM temp_result_diabetes;
+```
+
+### 2. What is the percentage of patients with HbA1c \> 7%?
+
+Among diabetic patients, multiple encounters and observations have been documented, indicating elevated HbA1c levels exceeding 7%. The query sought to identify the latest measurement for each distinct patient. The outcome reveals a consistent pattern wherein all patients exhibit HbA1c levels surpassing the 7% threshold. This uniformity underscores the prevalence of elevated HbA1c levels within the diabetic patient population.
+
+```{sql connection=con}
+-- percentage of patients with HbA1c > 7%, considering the latest date
+SELECT
+    COUNT(CASE WHEN hba1c_percentage > 7 THEN 1 END) * 100.0 / COUNT(DISTINCT patient) AS percentage
+FROM (
+  -- selecting the latest date for each patient
+    SELECT
+        patient,
+        MAX(date) AS latest_date,
+        MAX(hba1c_percentage) AS hba1c_percentage
+    FROM diabetes_glucose
+    GROUP BY patient
+) AS latest_data;
+```
+
+### 3. Group by age (18-30; 30 -- 40; 40-50 and above 60)
+
+```{sql connection=con, output.var = "diabetes_age_range"}
+-- grouping patients by age ranges and storing into the R table
+SELECT
+    CASE
+        WHEN age BETWEEN 18 AND 30 THEN '18-30'
+        WHEN age BETWEEN 31 AND 40 THEN '30-40'
+        WHEN age BETWEEN 41 AND 50 THEN '40-50'
+        WHEN age >= 61 THEN 'above 60'
+        ELSE 'Unknown'  --  cases where age doesn't fall into any range
+    END AS age_range,
+    COUNT(DISTINCT patient_id) AS patient_count
+FROM temp_result_diabetes
+GROUP BY age_range
+ORDER BY age_range;
+```
+
+```{r}
+# loading ggplot2 library
+library(ggplot2)
+
+# convering 'patient_count' to numeric
+diabetes_age_range$patient_count <- as.numeric(diabetes_age_range$patient_count)
+
+# checking for and handle missing values
+diabetes_age_range <- na.omit(diabetes_age_range)
+
+# ensuring 'age_range' is a Factor
+diabetes_age_range$age_range <- factor(diabetes_age_range$age_range)
+
+# creating a bar plot with adjusted y-axis scale
+ggplot(diabetes_age_range, aes(x = age_range, y = patient_count, fill = age_range)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'Diabetic Patients Grouped by Age Ranges', x = 'Age Range', y = 'Patient Count') +
+  theme_minimal() +
+  scale_y_continuous(expand = c(0, 0), breaks = seq(0, max(diabetes_age_range$patient_count), by = 50))
+```
+In the visualization of the results, a predominant portion of the patient population falls into the age group above 60 years old, indicating a significant representation of elderly individuals. Conversely, the age range of 18 to 30 exhibits a smaller patient population. Notably, a considerable portion of the data lacks recorded age information, constituting the second-largest group and contributing to the "Unknown" category. This emphasizes the need for more comprehensive age data recording within the dataset.
+
+### 4. Group by race
+
+```{sql connection=con, output.var = "diabetes_race"}
+-- Group patients by race and count
+SELECT
+    race,
+    COUNT(DISTINCT patient_id) AS patient_count
+FROM temp_result_diabetes
+GROUP BY race
+ORDER BY race;
+```
+
+```{r}
+# loading ggplot2 library
+library(ggplot2)
+
+# converting 'patient_count' to numeric
+diabetes_race$patient_count <- as.numeric(diabetes_race$patient_count)
+
+# checking for and handle missing values
+diabetes_race <- na.omit(diabetes_race)
+
+# ensuring 'race' is a factor
+diabetes_race$race <- factor(diabetes_race$race)
+
+# creating a bar plot with adjusted y-axis scale
+ggplot(diabetes_race, aes(x = race, y = patient_count, fill = race)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'Diabetic patients Grouped by Race', x = 'Race', y = 'Patient Count') +
+  theme_minimal() +
+  scale_y_continuous(expand = c(0, 0), breaks = seq(0, max(diabetes_race$patient_count), by = 100))
+
+
+```
+Upon visualizing the race distribution among diabetic patients, a substantial majority is identified as White, indicating a significant representation within the diabetic population. The distribution among Asian and Black patients appears to be roughly comparable, with moderate prevalence. Additionally, there are smaller recorded populations for Native and other racial categories. This observation underscores the diversity within the diabetic patient population, with varied racial representations across different groups.
